@@ -15,6 +15,9 @@ It has been field-tested on drums, full mixes, strummed guitar and solo piano.
 > **Status:** v0.5, Build 50010. Working prototype; see [Known issues](#known-issues).
 
 ---
+<img src="docs/images/AudioClock.jpg" width="409">
+---
+
 
 ## How it works
 
