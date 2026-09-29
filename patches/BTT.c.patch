@@ -1,0 +1,123 @@
+--- upstream/src/BTT.c
++++ firmware/audioclock_5/src/BTT.c
+@@ -26,6 +26,9 @@
+ 
+ ----------------------------------------------------------------------*/
+ #include "../BTT.h"
++#ifndef BTT_TEMPO_DECIMATION
++#define BTT_TEMPO_DECIMATION 4
++#endif
+ #include "STFT.h"
+ #include "Filter.h"
+ #include "Statistics.h"
+@@ -79,6 +82,16 @@
+   unsigned long long num_audio_samples_processed;
+   unsigned long long num_oss_frames_processed;
+   int                beat_period_oss_samples;
++  /* TEENSY PORT: sub-bin refinement of beat_period_oss_samples.
++     Candidate tempo lags are integer indices into autocorrelation_real, so
++     the reported tempo is quantised to one oss bin — 0.75 BPM at 125 BPM,
++     worse as tempo rises. The integer is still used for ALL internal
++     indexing (cbss, beat phase, histogram); this float is used only by the
++     getters. Note that interpolating the tempo HISTOGRAM does not work:
++     it deposits a symmetric Gaussian centred on the integer candidate, so
++     its peak is always exactly on a bin. The autocorrelation is where the
++     real sub-bin information lives. */
++  float              beat_period_oss_interp;
+   
+   float*             cbss;
+   int                cbss_length;
+@@ -272,6 +285,7 @@
+   memset(self->predicted_beat_signal, 0, self->cbss_length * sizeof(*self->predicted_beat_signal));
+   
+   self->beat_period_oss_samples = 0;
++  self->beat_period_oss_interp  = 0.0f;
+   self->cbss_index              = 0;
+   
+   if(bpm > 0)
+@@ -287,6 +301,7 @@
+          //normalize height later
+           self->gaussian_tempo_histogram[lag] = 1;
+           self->beat_period_oss_samples = lag;
++          self->beat_period_oss_interp  = (float)lag;
+         
+           int i;
+           for(i=self->cbss_length-1; i>=0; i-=lag)
+@@ -304,7 +319,10 @@
+   if(self->tracking_mode == BTT_METRONOME_MODE)
+     return self->metronome_lag * stft_get_hop(self->spectral_flux_stft);
+   else
+-    return self->beat_period_oss_samples * stft_get_hop(self->spectral_flux_stft);
++    /* TEENSY PORT: interpolated lag. Rounding to whole audio samples costs
++       ~0.005% of a beat period at 44.1kHz — far finer than the oss bin. */
++    return (int)(self->beat_period_oss_interp
++                 * stft_get_hop(self->spectral_flux_stft) + 0.5f);
+ }
+ 
+ /*--------------------------------------------------------------------*/
+@@ -315,7 +333,7 @@
+   else if(self->tracking_mode == BTT_METRONOME_MODE)
+     return LAG_TO_BPM(self->metronome_lag);
+   else
+-    return LAG_TO_BPM(self->beat_period_oss_samples);
++    return LAG_TO_BPM(self->beat_period_oss_interp);   /* TEENSY PORT */
+ }
+ 
+ /*--------------------------------------------------------------------*/
+@@ -556,6 +574,46 @@
+     }
+   
+   self->beat_period_oss_samples = index_of_max_gaussian;
++
++  /* TEENSY PORT: sub-bin tempo refinement.
++     Fit a parabola through the autocorrelation peak at the winning
++     candidate lag and take its vertex. The denominator is negative at a
++     true maximum, so guarding on it also rejects flat or degenerate peaks.
++     Delta is clamped to +/-0.5 — a vertex further than half a bin means the
++     argmax was not really the peak.
++
++     The refined value is only trusted when it agrees with the smoothed
++     histogram argmax to within 1.5 bins; otherwise the histogram wins and
++     we snap. The EMA runs at the tempo tracking rate (86 Hz with
++     decimation 4), giving a time constant of roughly a quarter second —
++     long enough to average out per-frame autocorrelation jitter, short
++     enough to follow a genuine tempo change. */
++  {
++    int   L     = candidate_tempo_lags[index_of_max_score];
++    float refined = (float)L;
++
++    if((L > 0) && (L < self->oss_length - 1))
++      {
++        float ym1 = self->autocorrelation_real[L - 1];
++        float y0  = self->autocorrelation_real[L];
++        float yp1 = self->autocorrelation_real[L + 1];
++        float denom = ym1 - 2.0f * y0 + yp1;
++        if(denom < -1e-12f)
++          {
++            float delta = 0.5f * (ym1 - yp1) / denom;
++            if(delta >  0.5f) delta =  0.5f;
++            if(delta < -0.5f) delta = -0.5f;
++            refined += delta;
++          }
++      }
++
++    if((self->beat_period_oss_interp <= 0.0f) ||
++       (fabsf(refined - (float)index_of_max_gaussian) > 1.5f))
++      self->beat_period_oss_interp = (float)index_of_max_gaussian;
++    else
++      self->beat_period_oss_interp =
++        0.95f * self->beat_period_oss_interp + 0.05f * refined;
++  }
+ }
+ 
+ /*--------------------------------------------------------------------*/
+@@ -709,7 +767,8 @@
+   if((self->tracking_mode == BTT_ONSET_AND_TEMPO_TRACKING) ||
+      (self->tracking_mode == BTT_ONSET_AND_TEMPO_AND_BEAT_TRACKING))
+       if(self->num_oss_frames_processed >= self->oss_length)
+-        btt_tempo_tracking(self);
++        if((self->num_oss_frames_processed & (BTT_TEMPO_DECIMATION-1)) == 0)
++          btt_tempo_tracking(self);
+ 
+   if(self->tracking_mode >= BTT_ONSET_AND_TEMPO_AND_BEAT_TRACKING)
+     if(self->beat_period_oss_samples > 0)
